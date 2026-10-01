@@ -1,7 +1,7 @@
 import { useEffect, type CSSProperties, type ReactNode } from "react";
 import ReactPlayer from "react-player";
-import { formatDuration } from "./types";
-import { usePlayer } from "./player-context";
+import { formatDuration } from "./types.js";
+import { usePlayer } from "./player-context.js";
 
 export interface PlayerLabels {
   play: string;

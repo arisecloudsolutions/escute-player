@@ -9,7 +9,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import type { CatalogSource, Playlist, Track } from "./types";
+import type { CatalogSource, Playlist, Track } from "./types.js";
 
 export type RepeatMode = "off" | "all" | "one";
 
