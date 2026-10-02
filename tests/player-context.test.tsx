@@ -7,11 +7,10 @@ import type { CatalogSource, Playlist, Track } from "../src/types";
 function track(id: string): Track {
   return {
     id,
-    title: `Faixa ${id}`,
-    artist: "Junkie Dust",
+    title: `Track ${id}`,
+    artist: "Example Artist",
     durationSeconds: 210,
-    mediaUrl: `https://cdn.example/${id}.mp3`,
-    mediaKind: "audio",
+    source: { kind: "file", url: `https://cdn.example/${id}.mp3` },
   };
 }
 

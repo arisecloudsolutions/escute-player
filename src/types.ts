@@ -1,28 +1,44 @@
 /**
- * Neutral data contract.
+ * Public data contract.
  *
- * Deliberately free of any ORM, schema or framework type: the portal feeds this
- * from a versioned seed today and from `escute-online-api` (REST /v1) later.
- * Nothing here knows about MySQL, Spaces or Next.js.
+ * Framework-free and storage-free by design: a track is described by *what it
+ * is* (see `MediaSource`), not by where it lives. Consumers map their own
+ * catalogue — CMS, database or REST API — onto this shape.
  */
 
-export type TrackMediaKind = "audio" | "embed";
+export type MediaKind = "file" | "stream" | "embed";
+
+/**
+ * Where the audio/video actually comes from.
+ *
+ * `file`/`stream` are progressive media the engine can seek in. `embed` kinds are
+ * third-party pages: the provider decides what is allowed, and most of them do
+ * not expose a seekable timeline — that is reported honestly by
+ * `trackCapabilities()` instead of faked.
+ */
+export type MediaSource =
+  | { kind: "file"; url: string; mimeType?: string }
+  | { kind: "stream"; url: string; mimeType?: string }
+  | { kind: "hls"; url: string }
+  | { kind: "youtube"; id?: string; url?: string; startSeconds?: number }
+  | { kind: "soundcloud"; url: string }
+  | { kind: "vimeo"; url: string }
+  | { kind: "spotify"; url: string }
+  | { kind: "embed"; url: string; title?: string }
+  | { kind: "custom"; url: string; options?: Record<string, unknown> };
 
 export interface Track {
-  /** Stable identifier within its source (slug, database id, …). */
+  /** Stable identifier within its own catalogue. */
   id: string;
   title: string;
-  artist: string;
-  /** Duration in seconds. `null` when unknown (common for embeds). */
-  durationSeconds: number | null;
-  /** Direct, playable URL. For embeds this is the provider page URL. */
-  mediaUrl: string;
-  mediaKind: TrackMediaKind;
-  /** Cover image URL, when available. */
-  artworkUrl?: string | null;
+  artist?: string | null;
   album?: string | null;
-  /** Only rendered for `embed` tracks. */
-  provider?: string | null;
+  artworkUrl?: string | null;
+  /** Unknown for most embeds — leave `null` rather than guessing. */
+  durationSeconds?: number | null;
+  source: MediaSource;
+  /** Credits/rights note surfaced by the host UI, never enforced here. */
+  rightsNote?: string | null;
 }
 
 export interface Playlist {
@@ -33,15 +49,106 @@ export interface Playlist {
   tracks: Track[];
 }
 
-/**
- * Data source. Implemented by the consumer: the portal ships a seed adapter and
- * will add a REST adapter once the API is live.
- */
+/** Data source implemented by the consumer. */
 export interface CatalogSource {
   loadPlaylists(): Promise<Playlist[]>;
 }
 
-/** Seconds -> `m:ss` (or `h:mm:ss`), rounded down. */
+export interface TrackCapabilities {
+  mediaKind: MediaKind;
+  /** The engine can scrub the timeline. */
+  seekable: boolean;
+  /** Duration is known in advance. */
+  hasDuration: boolean;
+  /** Playback depends on a third-party service. */
+  requiresNetwork: boolean;
+  /** Playback works offline once cached (never assumed). */
+  offline: boolean;
+}
+
+const EMBED_KINDS = new Set<MediaSource["kind"]>([
+  "youtube",
+  "soundcloud",
+  "vimeo",
+  "spotify",
+  "embed",
+]);
+
+export function mediaKind(source: MediaSource): MediaKind {
+  if (EMBED_KINDS.has(source.kind)) return "embed";
+  return source.kind === "hls" ? "stream" : "file";
+}
+
+export function trackCapabilities(track: Track): TrackCapabilities {
+  const kind = track.source.kind;
+
+  if (kind === "youtube") {
+    // The official embed does not expose a scrubbable timeline to the page.
+    return {
+      mediaKind: "embed",
+      seekable: false,
+      hasDuration: typeof track.durationSeconds === "number",
+      requiresNetwork: true,
+      offline: false,
+    };
+  }
+
+  if (EMBED_KINDS.has(kind)) {
+    return {
+      mediaKind: "embed",
+      seekable: false,
+      hasDuration: typeof track.durationSeconds === "number",
+      requiresNetwork: true,
+      offline: false,
+    };
+  }
+
+  return {
+    mediaKind: kind === "hls" ? "stream" : "file",
+    seekable: true,
+    hasDuration: typeof track.durationSeconds === "number",
+    requiresNetwork: true,
+    offline: false,
+  };
+}
+
+/** Best-effort display name of the provider behind a source. */
+export function providerLabel(source: MediaSource): string | null {
+  switch (source.kind) {
+    case "youtube":
+      return "YouTube";
+    case "soundcloud":
+      return "SoundCloud";
+    case "vimeo":
+      return "Vimeo";
+    case "spotify":
+      return "Spotify";
+    case "hls":
+      return "HLS";
+    case "file":
+    case "stream":
+      return null;
+    default:
+      return null;
+  }
+}
+
+/** URL handed to the engine. Normalises YouTube so ids and URLs both work. */
+export function resolveUrl(source: MediaSource): string {
+  if (source.kind === "youtube") {
+    if (source.url) return source.url;
+    if (source.id) {
+      const base = source.startSeconds
+        ? `https://www.youtube.com/watch?v=${source.id}&t=${source.startSeconds}`
+        : `https://www.youtube.com/watch?v=${source.id}`;
+      return base;
+    }
+    return "";
+  }
+  return source.url;
+}
+
+/** Seconds -> `m:ss` / `h:mm:ss`, or `--:--` when unknown. */
 export function formatDuration(totalSeconds: number | null | undefined): string {
   if (totalSeconds === null || totalSeconds === undefined || !Number.isFinite(totalSeconds)) {
     return "--:--";

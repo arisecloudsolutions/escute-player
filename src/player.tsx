@@ -1,7 +1,10 @@
-import { useEffect, type CSSProperties, type ReactNode } from "react";
-import ReactPlayer from "react-player";
-import { formatDuration } from "./types.js";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { formatDuration, providerLabel, resolveUrl, type Track } from "./types.js";
 import { usePlayer } from "./player-context.js";
+import { reactPlayerEngine } from "./engines/react-player.js";
+import type { MediaEngine } from "./engines/types.js";
+import { updateMediaSession } from "./media-session.js";
+import { useKeyboardShortcuts } from "./keyboard.js";
 
 export interface PlayerLabels {
   play: string;
@@ -12,7 +15,6 @@ export interface PlayerLabels {
   repeat: string;
   mute: string;
   unmute: string;
-  volume: string;
   seek: string;
   loading: string;
   error: string;
@@ -20,28 +22,36 @@ export interface PlayerLabels {
   collapse: string;
   queue: string;
   empty: string;
+  notSeekable: string;
+  pictureInPicture: string;
+  shortcutHint: string;
 }
 
+/**
+ * Copy is a prop: the package ships no strings, so a host can localise it and
+ * the component can be reused by any product.
+ */
 const DEFAULT_LABELS: PlayerLabels = {
   play: "Play",
-  pause: "Pausa",
-  next: "Próxima",
-  previous: "Anterior",
-  shuffle: "Aleatório",
-  repeat: "Repetir",
-  mute: "Silenciar",
-  unmute: "Restaurar som",
-  volume: "Volume",
-  seek: "Posição",
-  loading: "Carregando",
-  error: "Não foi possível reproduzir",
-  expand: "Expandir",
-  collapse: "Recolher",
-  queue: "Fila",
-  empty: "Nada para tocar",
+  pause: "Pause",
+  next: "Next track",
+  previous: "Previous track",
+  shuffle: "Shuffle",
+  repeat: "Repeat",
+  mute: "Mute",
+  unmute: "Unmute",
+  seek: "Track position",
+  loading: "Loading…",
+  error: "This track could not be played",
+  expand: "Open queue",
+  collapse: "Close queue",
+  queue: "Audio player",
+  empty: "Nothing to play yet",
+  notSeekable: "Seeking is not available for this source",
+  pictureInPicture: "Picture in picture",
+  shortcutHint: "Space play · ← → seek · ↑ ↓ volume · M mute",
 };
 
-/** Style hooks so the host can restyle the player without forking it. */
 export interface PlayerTheme {
   container: CSSProperties;
   button: CSSProperties;
@@ -50,55 +60,70 @@ export interface PlayerTheme {
   submeta: CSSProperties;
   slider: CSSProperties;
   error: CSSProperties;
+  list: CSSProperties;
 }
 
+/**
+ * Styling defaults read the host's CSS custom properties when present, so a
+ * design system can restyle the player with theme tokens instead of overrides.
+ */
 const DEFAULT_THEME: PlayerTheme = {
   container: {
-    background: "var(--color-surface-raised)",
-    borderTop: "1px solid var(--color-border)",
+    background: "var(--player-bg, Canvas)",
+    color: "var(--player-fg, CanvasText)",
+    borderTop: "1px solid var(--player-border, rgba(127,127,127,0.35))",
     padding: "0.75rem 1rem",
+    fontFamily: "var(--player-font, system-ui, sans-serif)",
   },
   button: {
     background: "transparent",
-    border: "1px solid var(--color-border)",
-    color: "var(--color-text-secondary)",
+    border: "1px solid var(--player-border, rgba(127,127,127,0.35))",
+    color: "inherit",
     borderRadius: 8,
     padding: "6px 10px",
     cursor: "pointer",
   },
   buttonActive: {
-    borderColor: "var(--color-brand-accent)",
-    color: "var(--color-brand-accent)",
+    borderColor: "var(--player-accent, currentColor)",
+    color: "var(--player-accent, currentColor)",
   },
-  meta: { color: "var(--color-text-primary)", fontWeight: 600, fontSize: 14 },
-  submeta: { color: "var(--color-muted)", fontSize: 12 },
-  slider: { accentColor: "var(--color-brand-accent)", flex: 1 },
-  error: { color: "var(--color-danger)", fontSize: 12 },
+  meta: { fontWeight: 600, fontSize: 14 },
+  submeta: { fontSize: 12, opacity: 0.75 },
+  slider: { accentColor: "var(--player-accent, currentColor)", flex: 1 },
+  error: { fontSize: 12, color: "var(--player-error, #dc2626)" },
+  list: { listStyle: "none", padding: 0, margin: "0.5rem 0 0" },
 };
 
 export interface PlayerProps {
-  /** Visible labels — the package ships no copy. */
   labels?: Partial<PlayerLabels>;
-  /** Class names / CSS overrides so the host owns the visual language. */
   theme?: Partial<PlayerTheme>;
-  /** Inline styles merged last. */
+  /** Style overrides applied last. */
   style?: CSSProperties;
   className?: string;
+  /** Swap the playback engine (default: react-player). */
+  engine?: MediaEngine;
+  /** Enable keyboard shortcuts. */
+  shortcuts?: boolean;
   /** Rendered when nothing is loaded. */
   fallback?: ReactNode;
 }
 
-/**
- * Persistent player.
- *
- * Styling is intentionally unopinionated: the host passes Tailwind classes or
- * CSS custom properties, so the same component works across the portal and any
- * future band front without forking.
- */
-export default function Player({ labels, theme, style, className, fallback }: PlayerProps) {
+const SEEK_STEP_SECONDS = 5;
+const VOLUME_STEP = 0.1;
+
+export default function Player({
+  labels,
+  theme,
+  style,
+  className,
+  engine = reactPlayerEngine,
+  shortcuts = true,
+  fallback,
+}: PlayerProps) {
   const player = usePlayer();
   const text: PlayerLabels = { ...DEFAULT_LABELS, ...labels };
   const tokens: PlayerTheme = { ...DEFAULT_THEME, ...theme };
+  const [pipAvailable, setPipAvailable] = useState(false);
 
   const {
     current,
@@ -112,28 +137,60 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
     isShuffled,
     repeat,
     expanded,
+    canSeek,
   } = player;
 
-  // Keep the media element in sync with the context.
+  const shortcutHandlers = useMemo(
+    () => ({
+      onToggle: player.toggle,
+      onNext: player.next,
+      onPrevious: player.previous,
+      onMute: player.toggleMute,
+      onVolumeUp: () => player.nudgeVolume(VOLUME_STEP),
+      onVolumeDown: () => player.nudgeVolume(-VOLUME_STEP),
+      onSeekForward: () => player.seek(positionSeconds + SEEK_STEP_SECONDS),
+      onSeekBackward: () => player.seek(Math.max(0, positionSeconds - SEEK_STEP_SECONDS)),
+    }),
+    [player, positionSeconds],
+  );
+
+  useKeyboardShortcuts(shortcutHandlers, { enabled: shortcuts });
+
+  // OS-level controls (lock screen, headset, car).
   useEffect(() => {
-    const media = player.mediaRef.current;
-    if (!media) return;
-    media.volume = isMuted ? 0 : volume;
-    if (isPlaying) void media.play().catch(() => undefined);
-    else media.pause();
-  }, [player, isPlaying, isMuted, volume, current?.mediaUrl]);
+    updateMediaSession(current, current?.artworkUrl ?? null, isPlaying ? "playing" : "paused", {
+      play: player.resume,
+      pause: player.pause,
+      next: player.next,
+      prev: player.previous,
+      stop: player.pause,
+    });
+  }, [current, isPlaying, player]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    setPipAvailable("pictureInPictureEnabled" in document);
+  }, []);
+
+  const openPictureInPicture = useCallback(async () => {
+    try {
+      const media = document.querySelector<HTMLVideoElement>("video");
+      if (media && document.pictureInPictureEnabled) {
+        await media.requestPictureInPicture();
+      }
+    } catch {
+      // Not available for this source; the button simply does nothing.
+    }
+  }, []);
 
   if (!current) return <>{fallback ?? null}</>;
 
+  const provider = providerLabel(current.source);
   const repeatLabel = repeat === "one" ? `${text.repeat} (1)` : text.repeat;
+  const Engine = engine.Component;
 
   return (
-    <div
-      className={className}
-      style={{ ...tokens.container, ...style }}
-      role="region"
-      aria-label={text.queue}
-    >
+    <div className={className} style={{ ...tokens.container, ...style }} role="region" aria-label={text.queue}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
         <button
           type="button"
@@ -144,28 +201,28 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
           {isPlaying ? "❚❚" : "▶"}
         </button>
 
-        <button
-          type="button"
-          onClick={player.previous}
-          aria-label={text.previous}
-          style={tokens.button}
-        >
+        <button type="button" onClick={player.previous} aria-label={text.previous} style={tokens.button}>
           ⏮
         </button>
-        <button
-          type="button"
-          onClick={player.next}
-          aria-label={text.next}
-          style={tokens.button}
-        >
+        <button type="button" onClick={player.next} aria-label={text.next} style={tokens.button}>
           ⏭
         </button>
+
+        {current.artworkUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element -- consumer-provided URL, cannot be optimised here
+          <img
+            src={current.artworkUrl}
+            alt=""
+            width={40}
+            height={40}
+            style={{ borderRadius: 6, objectFit: "cover" }}
+          />
+        ) : null}
 
         <div style={{ minWidth: 0, flex: "1 1 160px" }}>
           <div style={tokens.meta}>{current.title}</div>
           <div style={tokens.submeta}>
-            {current.artist}
-            {current.provider ? ` · ${current.provider}` : ""}
+            {[current.artist, provider, current.rightsNote].filter(Boolean).join(" · ")}
           </div>
         </div>
 
@@ -196,7 +253,16 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
         >
           {isMuted ? "🔇" : "🔊"}
         </button>
-
+        {pipAvailable ? (
+          <button
+            type="button"
+            onClick={openPictureInPicture}
+            aria-label={text.pictureInPicture}
+            style={tokens.button}
+          >
+            ⧉
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={() => player.setExpanded(!expanded)}
@@ -218,7 +284,9 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
           max={Math.max(1, durationSeconds ?? 0)}
           value={Math.min(positionSeconds, durationSeconds ?? 0)}
           onChange={(event) => player.seek(Number(event.target.value))}
-          aria-label={text.seek}
+          disabled={!canSeek}
+          title={canSeek ? text.seek : text.notSeekable}
+          aria-label={canSeek ? text.seek : text.notSeekable}
           aria-valuetext={`${formatDuration(positionSeconds)} de ${formatDuration(durationSeconds)}`}
           style={tokens.slider}
         />
@@ -227,13 +295,16 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
         </span>
       </div>
 
-      {/* Live region so assistive tech hears state changes. */}
-      <p aria-live="polite" style={{ ...tokens.submeta, minHeight: 18, marginTop: "0.25rem" }}>
+      <p aria-live="polite" style={{ ...tokens.submeta, minHeight: 18, margin: "0.25rem 0 0" }}>
         {isBuffering ? text.loading : error ? text.error : ""}
       </p>
 
+      {shortcuts ? (
+        <p style={{ ...tokens.submeta, margin: "0.15rem 0 0" }}>{text.shortcutHint}</p>
+      ) : null}
+
       {expanded ? (
-        <ol style={{ listStyle: "none", padding: 0, marginTop: "0.5rem" }}>
+        <ol style={tokens.list}>
           {player.queue.map((track, index) => (
             <li key={track.id}>
               <button
@@ -245,36 +316,34 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
                   textAlign: "left",
                   padding: "0.4rem 0.5rem",
                   cursor: "pointer",
-                  background: index === player.queueIndex ? "var(--color-surface, #0e1526)" : "transparent",
+                  background: index === player.queueIndex ? "var(--player-active, rgba(127,127,127,0.15))" : "transparent",
                   border: "none",
-                  color:
-                    index === player.queueIndex ? tokens.meta.color : tokens.submeta.color,
+                  color: "inherit",
                   fontSize: 13,
                 }}
               >
-                {track.title} — {track.artist}
+                {track.title}
+                {track.artist ? ` — ${track.artist}` : ""}
               </button>
             </li>
           ))}
         </ol>
       ) : null}
 
-      <ReactPlayer
-        ref={player.mediaRef}
-        src={current.mediaUrl}
+      <Engine
+        source={current.source}
+        url={resolveUrl(current.source)}
         playing={isPlaying}
         volume={isMuted ? 0 : volume}
-        onReady={() => {
-          const media = player.mediaRef.current;
-          if (media && Number.isFinite(media.duration)) player.setDuration(media.duration);
+        muted={isMuted}
+        positionSeconds={positionSeconds}
+        onReady={(duration) => {
+          player.setDuration(duration);
           player.setBuffering(false);
           if (player.takeResumeIntent()) player.resume();
         }}
-        onTimeUpdate={(event) => player.setPosition(event.currentTarget.currentTime)}
-        onDurationChange={(event) => {
-          const duration = event.currentTarget.duration;
-          player.setDuration(Number.isFinite(duration) ? duration : null);
-        }}
+        onPosition={player.setPosition}
+        onDuration={player.setDuration}
         onEnded={player.next}
         onWaiting={() => player.setBuffering(true)}
         onPlaying={() => player.setBuffering(false)}
@@ -282,8 +351,9 @@ export default function Player({ labels, theme, style, className, fallback }: Pl
           player.setBuffering(false);
           player.reportError("playback-failed");
         }}
-        style={{ display: "none" }}
       />
     </div>
   );
 }
+
+export type { Track };

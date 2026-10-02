@@ -1,32 +1,35 @@
 {
-  "name": "@arise/escute-player",
-  "version": "0.1.0",
-  "description": "Player de musica reutilizavel do escute.online. Client-only, sem dependencia de banco, storage ou framework de roteamento.",
-  "license": "UNLICENSED",
-  "private": true,
+  "name": "@escute/player",
+  "version": "1.0.0",
+  "description": "Player de audio/video reutilizavel para React: arquivos locais, HLS, YouTube, SoundCloud, Vimeo, Spotify e embeds, com fila, repeticao, Media Session e atalhos. Sem dependencia de banco, storage ou framework de roteamento.",
+  "license": "MIT",
+  "private": false,
   "type": "module",
   "sideEffects": false,
-  "files": ["dist", "README.md"],
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "main": "./dist/cjs/index.js",
+  "types": "./dist/esm/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "default": "./dist/esm/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node scripts/postbuild.mjs",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test"
-  },
-  "peerDependencies": {
-    "react": ">=19",
-    "react-dom": ">=19",
-    "react-player": "^3.4.0"
+    "check": "npm run typecheck && npm run test",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",
@@ -45,5 +48,40 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "module": "./dist/esm/index.js",
+  "keywords": [
+    "react",
+    "player",
+    "audio",
+    "video",
+    "music",
+    "podcast",
+    "youtube",
+    "soundcloud",
+    "hls",
+    "media-session",
+    "queue",
+    "playlist",
+    "headless"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arisecloudsolutions/escute-player.git"
+  },
+  "homepage": "https://github.com/arisecloudsolutions/escute-player#readme",
+  "bugs": {
+    "url": "https://github.com/arisecloudsolutions/escute-player/issues"
+  },
+  "author": "Escute",
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "dependencies": {
+    "react-player": "^3.4.0"
   }
 }

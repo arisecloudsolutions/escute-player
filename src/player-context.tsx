@@ -7,9 +7,8 @@ import {
   useRef,
   useState,
   type ReactNode,
-  type RefObject,
 } from "react";
-import type { CatalogSource, Playlist, Track } from "./types.js";
+import { trackCapabilities, type CatalogSource, type Playlist, type Track } from "./types.js";
 
 export type RepeatMode = "off" | "all" | "one";
 
@@ -41,11 +40,12 @@ export interface PlayerActions {
   previous(): void;
   seek(seconds: number): void;
   setVolume(value: number): void;
+  nudgeVolume(delta: number): void;
   toggleMute(): void;
   toggleShuffle(): void;
   cycleRepeat(): void;
   setExpanded(value: boolean): void;
-  /** Media bridge callbacks invoked by `<Player/>`. */
+  /** Media bridge callbacks, invoked by the engine. */
   reportError(message: string): void;
   setBuffering(value: boolean): void;
   setDuration(seconds: number | null): void;
@@ -53,12 +53,13 @@ export interface PlayerActions {
 }
 
 export interface PlayerContextValue extends PlayerState, PlayerActions {
-  /** Media element owned by the UI; the context only reads/writes it. */
-  mediaRef: RefObject<HTMLVideoElement | null>;
-  /**
-   * Returns and clears the pending "keep playing after the new track loads"
-   * intent. Called by `<Player/>` once the media element is ready.
-   */
+  /** True when the current source exposes a scrubbable timeline. */
+  canSeek: boolean;
+  /** True when the duration is known before playback starts. */
+  hasKnownDuration: boolean;
+  /** True when playback depends on a third-party service. */
+  requiresNetwork: boolean;
+  /** Returns and clears the "keep playing after load" intent. */
   takeResumeIntent(): boolean;
 }
 
@@ -66,12 +67,10 @@ const PlayerContext = createContext<PlayerContextValue | null>(null);
 
 export interface PlayerProviderProps {
   children: ReactNode;
-  /** Data source. Omit when the consumer feeds tracks directly. */
+  /** Catalogue. Omit when the consumer feeds tracks directly. */
   source?: CatalogSource;
-  /** Persistence key for volume/position. Omit to disable persistence. */
+  /** Persistence key for volume/mute. Omit to disable persistence. */
   storageKey?: string;
-  /** UI-owned media element. */
-  mediaRef?: RefObject<HTMLVideoElement | null>;
 }
 
 interface PersistedState {
@@ -97,15 +96,8 @@ const INITIAL_STATE: PlayerState = {
   status: "idle",
 };
 
-export function PlayerProvider({
-  children,
-  source,
-  storageKey,
-  mediaRef: externalMediaRef,
-}: PlayerProviderProps) {
+export function PlayerProvider({ children, source, storageKey }: PlayerProviderProps) {
   const [state, setState] = useState<PlayerState>(INITIAL_STATE);
-  const fallbackMediaRef = useRef<HTMLVideoElement | null>(null);
-  const mediaRef = externalMediaRef ?? fallbackMediaRef;
   const resumeAfterLoadRef = useRef(false);
 
   const patch = useCallback((next: Partial<PlayerState>) => {
@@ -116,18 +108,16 @@ export function PlayerProvider({
     if (!source) return;
 
     let cancelled = false;
-    setState((previous) => ({ ...previous, status: "loading" }));
+    patch({ status: "loading" });
 
     source
       .loadPlaylists()
       .then((playlists) => {
         if (cancelled) return;
-        setState((previous) => ({ ...previous, status: "ready", playlist: playlists[0] ?? null }));
+        patch({ status: "ready", playlist: playlists[0] ?? null });
       })
       .catch(() => {
-        if (!cancelled) {
-          patch({ status: "error", error: "catalog-unavailable" });
-        }
+        if (!cancelled) patch({ status: "error", error: "catalog-unavailable" });
       });
 
     return () => {
@@ -137,7 +127,6 @@ export function PlayerProvider({
 
   useEffect(() => {
     if (!storageKey || typeof window === "undefined") return;
-
     try {
       const raw = window.localStorage.getItem(storageKey);
       if (!raw) return;
@@ -153,14 +142,13 @@ export function PlayerProvider({
 
   useEffect(() => {
     if (!storageKey || typeof window === "undefined") return;
-
     try {
       window.localStorage.setItem(
         storageKey,
         JSON.stringify({ volume: state.volume, muted: state.isMuted } satisfies PersistedState),
       );
     } catch {
-      // Persistence is best-effort (quota, private mode).
+      // Persistence is best-effort.
     }
   }, [storageKey, state.volume, state.isMuted]);
 
@@ -175,7 +163,7 @@ export function PlayerProvider({
         error: null,
         isBuffering: Boolean(track),
         positionSeconds: 0,
-        durationSeconds: track ? null : null,
+        durationSeconds: track?.durationSeconds ?? null,
       });
     },
     [patch, state.isPlaying],
@@ -206,83 +194,76 @@ export function PlayerProvider({
   const pause = useCallback(() => patch({ isPlaying: false }), [patch]);
   const resume = useCallback(() => patch({ isPlaying: true }), [patch]);
 
-  const step = useCallback(
-    (direction: 1 | -1) => {
-      setState((previous) => {
-        if (previous.queue.length === 0) return previous;
+  const step = useCallback((direction: 1 | -1) => {
+    setState((previous) => {
+      if (previous.queue.length === 0) return previous;
 
-        let target = previous.queueIndex + direction;
+      let target = previous.queueIndex + direction;
 
-        if (direction === 1 && previous.isShuffled && previous.queue.length > 1) {
-          target = Math.floor(Math.random() * previous.queue.length);
-        }
+      if (direction === 1 && previous.isShuffled && previous.queue.length > 1) {
+        target = Math.floor(Math.random() * previous.queue.length);
+      }
 
-        if (target >= previous.queue.length) {
-          if (previous.repeat === "one") return { ...previous, positionSeconds: 0 };
-          target = previous.repeat === "all" ? 0 : previous.queue.length - 1;
-        }
-        if (target < 0) target = 0;
+      if (target >= previous.queue.length) {
+        if (previous.repeat === "one") return { ...previous, positionSeconds: 0 };
+        target = previous.repeat === "all" ? 0 : previous.queue.length - 1;
+      }
+      if (target < 0) target = 0;
 
-        const track = previous.queue[target];
-        if (!track) return previous;
+      const track = previous.queue[target];
+      if (!track) return previous;
 
-        resumeAfterLoadRef.current = previous.isPlaying;
-        return {
-          ...previous,
-          current: track,
-          queueIndex: target,
-          error: null,
-          isBuffering: true,
-          positionSeconds: 0,
-          durationSeconds: null,
-        };
-      });
-    },
-    [],
-  );
+      resumeAfterLoadRef.current = previous.isPlaying;
+      return {
+        ...previous,
+        current: track,
+        queueIndex: target,
+        error: null,
+        isBuffering: true,
+        positionSeconds: 0,
+        durationSeconds: track.durationSeconds ?? null,
+      };
+    });
+  }, []);
 
   const next = useCallback(() => step(1), [step]);
 
   const previous = useCallback(() => {
     setState((previous) => {
       if (previous.positionSeconds > 3) return { ...previous, positionSeconds: 0 };
-      const target = Math.max(0, previous.queueIndex - 1);
-      const track = previous.queue[target];
+      const track = previous.queue[Math.max(0, previous.queueIndex - 1)];
       if (!track) return previous;
       resumeAfterLoadRef.current = previous.isPlaying;
       return {
         ...previous,
         current: track,
-        queueIndex: target,
+        queueIndex: Math.max(0, previous.queueIndex - 1),
         isBuffering: true,
         positionSeconds: 0,
+        durationSeconds: track.durationSeconds ?? null,
       };
     });
   }, []);
 
-  const seek = useCallback(
-    (seconds: number) => {
-      const media = mediaRef.current;
-      const target = Math.max(0, seconds);
-      if (media) media.currentTime = target;
-      patch({ positionSeconds: target });
-    },
-    [mediaRef, patch],
-  );
+  const seek = useCallback((seconds: number) => patch({ positionSeconds: Math.max(0, seconds) }), [patch]);
 
   const setVolume = useCallback(
     (value: number) => patch({ volume: Math.min(1, Math.max(0, value)), isMuted: value <= 0 }),
     [patch],
   );
 
-  const toggleMute = useCallback(
-    () => patch({ isMuted: !state.isMuted }),
-    [patch, state.isMuted],
+  const nudgeVolume = useCallback(
+    (delta: number) => {
+      setState((previous) => {
+        const volume = Math.min(1, Math.max(0, previous.volume + delta));
+        return { ...previous, volume, isMuted: volume === 0 };
+      });
+    },
+    [],
   );
-  const toggleShuffle = useCallback(
-    () => patch({ isShuffled: !state.isShuffled }),
-    [patch, state.isShuffled],
-  );
+
+  const toggleMute = useCallback(() => patch({ isMuted: !state.isMuted }), [patch, state.isMuted]);
+  const toggleShuffle = useCallback(() => patch({ isShuffled: !state.isShuffled }), [patch, state.isShuffled]);
 
   const cycleRepeat = useCallback(() => {
     const order: RepeatMode[] = ["off", "all", "one"];
@@ -301,16 +282,20 @@ export function PlayerProvider({
     [patch],
   );
 
-  // Consumed by the UI layer when the element reports it is ready.
-  const consumeResumeIntent = useCallback(() => {
+  const takeResumeIntent = useCallback(() => {
     const resume = resumeAfterLoadRef.current;
     resumeAfterLoadRef.current = false;
     return resume;
   }, []);
 
+  const capabilities = state.current ? trackCapabilities(state.current) : null;
+
   const value = useMemo<PlayerContextValue>(
     () => ({
       ...state,
+      canSeek: capabilities?.seekable ?? false,
+      hasKnownDuration: capabilities?.hasDuration ?? false,
+      requiresNetwork: capabilities?.requiresNetwork ?? false,
       playPlaylist,
       playTrack,
       toggle,
@@ -320,6 +305,7 @@ export function PlayerProvider({
       previous,
       seek,
       setVolume,
+      nudgeVolume,
       toggleMute,
       toggleShuffle,
       cycleRepeat,
@@ -328,11 +314,13 @@ export function PlayerProvider({
       setBuffering,
       setDuration,
       setPosition,
-      mediaRef,
-      takeResumeIntent: consumeResumeIntent,
+      takeResumeIntent,
     }),
     [
       state,
+      capabilities?.seekable,
+      capabilities?.hasDuration,
+      capabilities?.requiresNetwork,
       playPlaylist,
       playTrack,
       toggle,
@@ -342,6 +330,7 @@ export function PlayerProvider({
       previous,
       seek,
       setVolume,
+      nudgeVolume,
       toggleMute,
       toggleShuffle,
       cycleRepeat,
@@ -350,8 +339,7 @@ export function PlayerProvider({
       setBuffering,
       setDuration,
       setPosition,
-      mediaRef,
-      consumeResumeIntent,
+      takeResumeIntent,
     ],
   );
 
